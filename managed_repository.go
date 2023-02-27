@@ -12,11 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package goblet
+package main
 
 import (
 	"bytes"
-	"context"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -33,9 +32,6 @@ import (
 	"github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/google/gitprotocolio"
-	"go.opencensus.io/stats"
-	"go.opencensus.io/tag"
-	"golang.org/x/oauth2"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -70,11 +66,6 @@ func getManagedRepo(localDiskPath string, u *url.URL, config *ServerConfig) *man
 }
 
 func openManagedRepository(config *ServerConfig, u *url.URL) (*managedRepository, error) {
-	u, err := config.URLCanonializer(u)
-	if err != nil {
-		return nil, err
-	}
-
 	localDiskPath := filepath.Join(config.LocalDiskCacheRoot, u.Host, u.Path)
 
 	m := getManagedRepo(localDiskPath, u, config)
@@ -104,21 +95,6 @@ func openManagedRepository(config *ServerConfig, u *url.URL) (*managedRepository
 	return m, nil
 }
 
-func logStats(command string, startTime time.Time, err error) {
-	code := codes.Unavailable
-	if st, ok := status.FromError(err); ok {
-		code = st.Code()
-	}
-	stats.RecordWithTags(context.Background(),
-		[]tag.Mutator{
-			tag.Insert(CommandTypeKey, command),
-			tag.Insert(CommandCanonicalStatusKey, code.String()),
-		},
-		OutboundCommandCount.M(1),
-		OutboundCommandProcessingTime.M(int64(time.Now().Sub(startTime)/time.Millisecond)),
-	)
-}
-
 type managedRepository struct {
 	localDiskPath string
 	lastUpdate    time.Time
@@ -132,18 +108,11 @@ func (r *managedRepository) lsRefsUpstream(command []*gitprotocolio.ProtocolV2Re
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "cannot construct a request object: %v", err)
 	}
-	t, err := r.config.TokenSource.Token()
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, "cannot obtain an OAuth2 access token for the server: %v", err)
-	}
 	req.Header.Add("Content-Type", "application/x-git-upload-pack-request")
 	req.Header.Add("Accept", "application/x-git-upload-pack-result")
 	req.Header.Add("Git-Protocol", "version=2")
-	t.SetAuthHeader(req)
 
-	startTime := time.Now()
 	resp, err := http.DefaultClient.Do(req)
-	logStats("ls-refs", startTime, err)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "cannot send a request to the upstream: %v", err)
 	}
@@ -189,30 +158,14 @@ func (r *managedRepository) fetchUpstream() (err error) {
 		splitGitFetch = true
 	}
 
-	var t *oauth2.Token
-	startTime := time.Now()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if splitGitFetch {
 		// Fetch heads and changes first.
-		t, err = r.config.TokenSource.Token()
-		if err != nil {
-			err = status.Errorf(codes.Internal, "cannot obtain an OAuth2 access token for the server: %v", err)
-			return err
-		}
-		err = runGit(op, r.localDiskPath, "-c", "http.extraHeader=Authorization: Bearer "+t.AccessToken, "fetch", "--progress", "-f", "-n", "origin", "refs/heads/*:refs/heads/*", "refs/changes/*:refs/changes/*")
+		err = runGit(op, r.localDiskPath, "fetch", "--progress", "-f", "-n", "origin", "refs/heads/*:refs/heads/*", "refs/changes/*:refs/changes/*")
 	}
 	if err == nil {
-		t, err = r.config.TokenSource.Token()
-		if err != nil {
-			err = status.Errorf(codes.Internal, "cannot obtain an OAuth2 access token for the server: %v", err)
-			return err
-		}
-		err = runGit(op, r.localDiskPath, "-c", "http.extraHeader=Authorization: Bearer "+t.AccessToken, "fetch", "--progress", "-f", "origin")
-	}
-	logStats("fetch", startTime, err)
-	if err == nil {
-		r.lastUpdate = startTime
+		err = runGit(op, r.localDiskPath, "fetch", "--progress", "-f", "origin")
 	}
 	return err
 }

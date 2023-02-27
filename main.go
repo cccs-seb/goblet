@@ -17,14 +17,13 @@ package main
 import (
 	"flag"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"time"
 
-	goblet "github.com/google/goblet/git"
+	"github.com/elazarl/goproxy"
 )
 
 var (
@@ -42,26 +41,50 @@ func main() {
 		log.Printf("%q %d request size: %d, response size %d, latency: %v", dump, status, requestSize, responseSize, latency)
 	}
 
-	var longRunningOperationLogger func(string, *url.URL) goblet.RunningOperation = func(action string, u *url.URL) goblet.RunningOperation {
+	var longRunningOperationLogger func(string, *url.URL) RunningOperation = func(action string, u *url.URL) RunningOperation {
 		log.Printf("Starting %s for %s", action, u.String())
 		return &logBasedOperation{action, u}
 	}
 
-	config := &goblet.ServerConfig{
+	config := &ServerConfig{
 		LocalDiskCacheRoot:         *cacheRoot,
 		RequestLogger:              requestLogger,
 		LongRunningOperationLogger: longRunningOperationLogger,
 	}
 
+	proxy := goproxy.NewProxyHttpServer()
+	proxy.Verbose = true
+
 	// Routes
-	http.HandleFunc("/healthz", func(w http.ResponseWriter, req *http.Request) {
-		w.Header().Set("Content-Type", "text/plain")
-		io.WriteString(w, "ok\n")
-	})
-	http.Handle("/", goblet.HTTPHandler(config))
+	proxy.OnRequest().HandleConnect(goproxy.AlwaysMitm)
+	proxy.OnRequest().DoFunc(
+		func(r *http.Request, ctx *goproxy.ProxyCtx) (*http.Request, *http.Response) {
+			// Check if request is Git -> refuse if not
+
+			// Create response writer
+			resp := goproxy.NewResponse(r, "", 200, "")
+			resp.Write()
+
+			// switch
+			// If /info/refs w/ service=git-upload-pack -> forward to git handler
+			// If /git-receive-pack -> not supported, reject
+			// If /git-upload-pack -> go through caching mechanism
+			// Else -> reject
+
+			return r, nil
+		},
+	)
+
+	// Filter specific requests
+	/*proxy.OnRequest(goproxy.ReqHostMatches(regexp.MustCompile(`.*github.*`))).DoFunc(
+		func(r *http.Request, ctx *goproxy.ProxyCtx) (*http.Request, *http.Response) {
+			ctx.Logf("Uh ohhhh, its github again: %s", r.URL.String())
+			return r, nil
+		},
+	)*/
 
 	// Run server
-	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%d", *port), nil))
+	log.Fatal(http.ListenAndServe(":8080", proxy))
 }
 
 type LongRunningOperation struct {

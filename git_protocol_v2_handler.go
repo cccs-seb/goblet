@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package goblet
+package main
 
 import (
 	"context"
@@ -22,8 +22,6 @@ import (
 
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/google/gitprotocolio"
-	"go.opencensus.io/stats"
-	"go.opencensus.io/tag"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -38,27 +36,9 @@ type gitProtocolErrorReporter interface {
 
 func handleV2Command(ctx context.Context, reporter gitProtocolErrorReporter, repo *managedRepository, command []*gitprotocolio.ProtocolV2RequestChunk, w io.Writer) bool {
 	startTime := time.Now()
-	var err error
-	ctx, err = tag.New(ctx, tag.Upsert(CommandTypeKey, command[0].Command))
-	if err != nil {
-		reporter.reportError(ctx, startTime, err)
-		return false
-	}
 
-	cacheState := "locally-served"
-	ctx, err = tag.New(ctx, tag.Upsert(CommandCacheStateKey, cacheState))
-	if err != nil {
-		reporter.reportError(ctx, startTime, err)
-		return false
-	}
 	switch command[0].Command {
 	case "ls-refs":
-		ctx, err = tag.New(ctx, tag.Update(CommandCacheStateKey, "queried-upstream"))
-		if err != nil {
-			reporter.reportError(ctx, startTime, err)
-			return false
-		}
-
 		resp, err := repo.lsRefsUpstream(command)
 		if err != nil {
 			reporter.reportError(ctx, startTime, err)
@@ -93,18 +73,12 @@ func handleV2Command(ctx context.Context, reporter gitProtocolErrorReporter, rep
 			reporter.reportError(ctx, startTime, err)
 			return false
 		} else if !hasAllWants {
-			ctx, err = tag.New(ctx, tag.Update(CommandCacheStateKey, "queried-upsteam"))
-			if err != nil {
-				reporter.reportError(ctx, startTime, err)
-				return false
-			}
-
-			fetchStartTime := time.Now()
 			fetchDone := make(chan error, 1)
 			go func() {
 				fetchDone <- repo.fetchUpstream()
 			}()
 			timer := time.NewTimer(checkFrequency)
+
 		LOOP:
 			for {
 				select {
@@ -130,7 +104,6 @@ func handleV2Command(ctx context.Context, reporter gitProtocolErrorReporter, rep
 					timer.Reset(checkFrequency)
 				}
 			}
-			stats.Record(ctx, UpstreamFetchWaitingTime.M(int64(time.Now().Sub(fetchStartTime)/time.Millisecond)))
 		}
 
 		if err := repo.serveFetchLocal(command, w); err != nil {
