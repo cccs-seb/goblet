@@ -1,1 +1,2 @@
-/goblet-server/goblet-server
+*.key
+*.crt

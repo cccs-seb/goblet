@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package goblet
+package main
 
 import (
 	"compress/gzip"
@@ -21,7 +21,6 @@ import (
 	"strings"
 
 	"github.com/google/gitprotocolio"
-	"go.opencensus.io/tag"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -35,21 +34,10 @@ func (s *httpProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer logCloser()
 	reporter := &httpErrorReporter{config: s.config, req: r, w: w}
 
-	ctx, err := tag.New(r.Context(), tag.Insert(CommandTypeKey, "not-a-command"))
-	if err != nil {
-		reporter.reportError(err)
-		return
-	}
-	r = r.WithContext(ctx)
+	// Check if request is passing basic auth through URL
+	// -> No nothing for now
 
-	// Technically, this server is an HTTP proxy, and it should use
-	// Proxy-Authorization / Proxy-Authenticate. However, existing
-	// authentication mechanism around Git is not compatible with proxy
-	// authorization. We use normal authentication mechanism here.
-	if err := s.config.RequestAuthorizer(r); err != nil {
-		reporter.reportError(err)
-		return
-	}
+	// Ensure we are serving Git-Protocol v2
 	if proto := r.Header.Get("Git-Protocol"); proto != "version=2" {
 		reporter.reportError(status.Error(codes.InvalidArgument, "accepts only Git protocol v2"))
 		return

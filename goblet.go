@@ -12,25 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package goblet
+package main
 
 import (
 	"io"
 	"net/http"
 	"net/url"
 	"time"
-
-	"golang.org/x/oauth2"
 )
 
 type ServerConfig struct {
 	LocalDiskCacheRoot string
-
-	URLCanonializer func(*url.URL) (*url.URL, error)
-
-	RequestAuthorizer func(*http.Request) error
-
-	TokenSource oauth2.TokenSource
 
 	ErrorReporter func(*http.Request, error)
 
