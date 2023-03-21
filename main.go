@@ -21,6 +21,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/elazarl/goproxy"
@@ -60,18 +61,29 @@ func main() {
 	proxy.OnRequest().DoFunc(
 		func(r *http.Request, ctx *goproxy.ProxyCtx) (*http.Request, *http.Response) {
 			// Check if request is Git -> refuse if not
+			if r.Header.Get("Git-Protocol") != "version=2" {
+				return r, goproxy.NewResponse(r, goproxy.ContentTypeText, http.StatusBadRequest, "accepts only Git protocol v2")
+			}
 
 			// Create response writer
-			resp := goproxy.NewResponse(r, "", 200, "")
-			resp.Write()
-
-			// switch
+			switch path := r.URL.Path; {
 			// If /info/refs w/ service=git-upload-pack -> forward to git handler
+			case strings.HasSuffix(path, "/info/refs"):
+				return handleInfoRefs(r, ctx, config)
 			// If /git-receive-pack -> not supported, reject
+			case strings.HasSuffix(path, "/git-receive-pack"):
+				return handleGitReceivePack(r, ctx, config)
 			// If /git-upload-pack -> go through caching mechanism
-			// Else -> reject
-
-			return r, nil
+			case strings.HasSuffix(path, "/git-upload-pack"):
+				return handleGitUploadPack(r, ctx, config)
+			default:
+				return r, goproxy.NewResponse(r, goproxy.ContentTypeText, http.StatusBadRequest, "unsupported operation")
+			}
+		},
+	)
+	proxy.OnResponse().DoFunc(
+		func(resp *http.Response, ctx *goproxy.ProxyCtx) *http.Response {
+			return resp
 		},
 	)
 
@@ -84,7 +96,7 @@ func main() {
 	)*/
 
 	// Run server
-	log.Fatal(http.ListenAndServe(":8080", proxy))
+	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%d", *port), proxy))
 }
 
 type LongRunningOperation struct {

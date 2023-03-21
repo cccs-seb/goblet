@@ -46,19 +46,3 @@ type ManagedRepository interface {
 
 	WriteBundle(io.Writer) error
 }
-
-func HTTPHandler(config *ServerConfig) http.Handler {
-	return &httpProxyServer{config}
-}
-
-func OpenManagedRepository(config *ServerConfig, u *url.URL) (ManagedRepository, error) {
-	return openManagedRepository(config, u)
-}
-
-func ListManagedRepositories(fn func(ManagedRepository)) {
-	managedRepos.Range(func(key, value interface{}) bool {
-		m := value.(*managedRepository)
-		fn(m)
-		return true
-	})
-}

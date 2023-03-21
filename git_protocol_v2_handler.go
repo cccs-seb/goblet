@@ -16,6 +16,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"io"
 	"strings"
 	"time"
@@ -34,48 +35,40 @@ type gitProtocolErrorReporter interface {
 	reportError(context.Context, time.Time, error)
 }
 
-func handleV2Command(ctx context.Context, reporter gitProtocolErrorReporter, repo *managedRepository, command []*gitprotocolio.ProtocolV2RequestChunk, w io.Writer) bool {
-	startTime := time.Now()
-
+func handleV2Command(ctx context.Context, repo *managedRepository, command []*gitprotocolio.ProtocolV2RequestChunk, w io.Writer, authentication string) error {
 	switch command[0].Command {
 	case "ls-refs":
-		resp, err := repo.lsRefsUpstream(command)
+		resp, err := repo.lsRefsUpstream(command, authentication)
 		if err != nil {
-			reporter.reportError(ctx, startTime, err)
-			return false
+			return err
 		}
 
 		refs, err := parseLsRefsResponse(resp)
 		if err != nil {
-			reporter.reportError(ctx, startTime, err)
-			return false
+			return err
 		}
 
 		if hasUpdate, err := repo.hasAnyUpdate(refs); err != nil {
-			reporter.reportError(ctx, startTime, err)
-			return false
+			return err
 		} else if hasUpdate {
-			go repo.fetchUpstream()
+			go repo.fetchUpstream(authentication)
 		}
 
 		writeResp(w, resp)
-		reporter.reportError(ctx, startTime, nil)
-		return true
+		return nil
 
 	case "fetch":
 		wantHashes, wantRefs, err := parseFetchWants(command)
 		if err != nil {
-			reporter.reportError(ctx, startTime, err)
-			return false
+			return err
 		}
 
 		if hasAllWants, err := repo.hasAllWants(wantHashes, wantRefs); err != nil {
-			reporter.reportError(ctx, startTime, err)
-			return false
+			return err
 		} else if !hasAllWants {
 			fetchDone := make(chan error, 1)
 			go func() {
-				fetchDone <- repo.fetchUpstream()
+				fetchDone <- repo.fetchUpstream(authentication)
 			}()
 			timer := time.NewTimer(checkFrequency)
 
@@ -83,21 +76,17 @@ func handleV2Command(ctx context.Context, reporter gitProtocolErrorReporter, rep
 			for {
 				select {
 				case <-ctx.Done():
-					reporter.reportError(ctx, startTime, ctx.Err())
-					return false
+					return ctx.Err()
 				case err := <-fetchDone:
 					if hasAllWants, checkErr := repo.hasAllWants(wantHashes, wantRefs); checkErr != nil {
-						reporter.reportError(ctx, startTime, checkErr)
-						return false
+						return checkErr
 					} else if !hasAllWants {
-						reporter.reportError(ctx, startTime, err)
-						return false
+						return err
 					}
 					break LOOP
 				case <-timer.C:
 					if hasAllWants, err := repo.hasAllWants(wantHashes, wantRefs); err != nil {
-						reporter.reportError(ctx, startTime, err)
-						return false
+						return err
 					} else if hasAllWants {
 						break LOOP
 					}
@@ -107,14 +96,13 @@ func handleV2Command(ctx context.Context, reporter gitProtocolErrorReporter, rep
 		}
 
 		if err := repo.serveFetchLocal(command, w); err != nil {
-			reporter.reportError(ctx, startTime, err)
-			return false
+			return err
 		}
-		reporter.reportError(ctx, startTime, nil)
-		return true
+
+		return nil
 	}
-	reporter.reportError(ctx, startTime, status.Error(codes.InvalidArgument, "unknown command"))
-	return false
+
+	return errors.New("unknown command")
 }
 
 func parseLsRefsResponse(chunks []*gitprotocolio.ProtocolV2ResponseChunk) (map[string]plumbing.Hash, error) {

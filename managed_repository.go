@@ -32,6 +32,7 @@ import (
 	"github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/google/gitprotocolio"
+	"golang.org/x/exp/slices"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -50,49 +51,66 @@ func init() {
 	}
 }
 
-func getManagedRepo(localDiskPath string, u *url.URL, config *ServerConfig) *managedRepository {
-	newM := &managedRepository{
-		localDiskPath: localDiskPath,
-		upstreamURL:   u,
-		config:        config,
+func urlFixer(u *url.URL) *url.URL {
+	result := url.URL{}
+	result.Scheme = "https"
+	result.Host = u.Host
+	result.Path = u.Path
+
+	if strings.HasSuffix(result.Path, "/info/refs") {
+		result.Path = strings.TrimSuffix(result.Path, "/info/refs")
+	} else if strings.HasSuffix(result.Path, "/git-receive-pack") {
+		result.Path = strings.TrimSuffix(result.Path, "/git-receive-pack")
+	} else if strings.HasSuffix(result.Path, "/git-upload-pack") {
+		result.Path = strings.TrimSuffix(result.Path, "/git-upload-pack")
 	}
-	newM.mu.Lock()
-	m, loaded := managedRepos.LoadOrStore(localDiskPath, newM)
-	ret := m.(*managedRepository)
-	if !loaded {
-		ret.mu.Unlock()
-	}
-	return ret
+
+	// Doesn't seem to apply to Gitlab
+	//result.Path = strings.TrimSuffix(result.Path, ".git")
+	return &result
 }
 
-func openManagedRepository(config *ServerConfig, u *url.URL) (*managedRepository, error) {
-	localDiskPath := filepath.Join(config.LocalDiskCacheRoot, u.Host, u.Path)
+func stripGitSuffixes(path string) string {
+	replacer := strings.NewReplacer("/info/refs", "", "/git-receive-pack", "", "/git-upload-pack", "", ".git", "")
+	return replacer.Replace(path)
+}
 
-	m := getManagedRepo(localDiskPath, u, config)
-	m.mu.Lock()
-	defer m.mu.Unlock()
+func getLocalGitRepositoryPath(config *ServerConfig, u *url.URL) string {
+	return filepath.Join(config.LocalDiskCacheRoot, u.Host, stripGitSuffixes(u.Path))
+}
 
-	if _, err := os.Stat(localDiskPath); err != nil {
-		if !os.IsNotExist(err) {
-			return nil, status.Errorf(codes.Internal, "error while initializing local Git repoitory: %v", err)
-		}
+func managedRepositoryExists(config *ServerConfig, u *url.URL) bool {
+	_, loaded := managedRepos.Load(getLocalGitRepositoryPath(config, u))
+	return loaded
+}
 
-		if err := os.MkdirAll(localDiskPath, 0750); err != nil {
-			return nil, status.Errorf(codes.Internal, "cannot create a cache dir: %v", err)
-		}
+func createManagedRepository(config *ServerConfig, u *url.URL, auth string) *managedRepository {
+	u = urlFixer(u)
+	localRepositoryPath := getLocalGitRepositoryPath(config, u)
 
-		op := noopOperation{}
-		runGit(op, localDiskPath, "init", "--bare")
-		runGit(op, localDiskPath, "config", "protocol.version", "2")
-		runGit(op, localDiskPath, "config", "uploadpack.allowfilter", "1")
-		runGit(op, localDiskPath, "config", "uploadpack.allowrefinwant", "1")
-		runGit(op, localDiskPath, "config", "repack.writebitmaps", "1")
-		// It seems there's a bug in libcurl and HTTP/2 doens't work.
-		runGit(op, localDiskPath, "config", "http.version", "HTTP/1.1")
-		runGit(op, localDiskPath, "remote", "add", "--mirror=fetch", "origin", u.String())
+	repository := &managedRepository{
+		localDiskPath: localRepositoryPath,
+		upstreamURL:   u,
+		config:        config,
+		isPublic:      true,
+		accessList:    []string{},
+	}
+	if auth != "" {
+		repository.isPublic = false
+		repository.accessList = append(repository.accessList, auth)
 	}
 
-	return m, nil
+	managedRepos.Store(localRepositoryPath, repository)
+	return repository
+}
+
+func getManagedRepository(config *ServerConfig, u *url.URL) (*managedRepository, bool) {
+	repo, ok := managedRepos.Load(getLocalGitRepositoryPath(config, u))
+	if !ok {
+		return nil, ok
+	}
+
+	return repo.(*managedRepository), ok
 }
 
 type managedRepository struct {
@@ -101,25 +119,59 @@ type managedRepository struct {
 	upstreamURL   *url.URL
 	config        *ServerConfig
 	mu            sync.RWMutex
+	isPublic      bool
+	accessList    []string
 }
 
-func (r *managedRepository) lsRefsUpstream(command []*gitprotocolio.ProtocolV2RequestChunk) ([]*gitprotocolio.ProtocolV2ResponseChunk, error) {
+func (r *managedRepository) open() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if _, err := os.Stat(r.localDiskPath); err != nil {
+		if !os.IsNotExist(err) {
+			return status.Errorf(codes.Internal, "error while initializing local Git repoitory: %v", err)
+		}
+
+		if err := os.MkdirAll(r.localDiskPath, 0750); err != nil {
+			return status.Errorf(codes.Internal, "cannot create a cache dir: %v", err)
+		}
+
+		op := noopOperation{}
+		runGit(op, r.localDiskPath, "", "init", "--bare")
+		runGit(op, r.localDiskPath, "", "config", "protocol.version", "2")
+		runGit(op, r.localDiskPath, "", "config", "uploadpack.allowfilter", "1")
+		runGit(op, r.localDiskPath, "", "config", "uploadpack.allowrefinwant", "1")
+		runGit(op, r.localDiskPath, "", "config", "repack.writebitmaps", "1")
+		// It seems there's a bug in libcurl and HTTP/2 doens't work.
+		runGit(op, r.localDiskPath, "", "config", "http.version", "HTTP/1.1")
+		runGit(op, r.localDiskPath, "", "remote", "add", "--mirror=fetch", "origin", r.upstreamURL.String())
+	}
+	return nil
+}
+
+func (r *managedRepository) lsRefsUpstream(command []*gitprotocolio.ProtocolV2RequestChunk, authentication string) ([]*gitprotocolio.ProtocolV2ResponseChunk, error) {
 	req, err := http.NewRequest("POST", r.upstreamURL.String()+"/git-upload-pack", newGitRequest(command))
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "cannot construct a request object: %v", err)
+		return nil, fmt.Errorf("cannot construct a request object: %v", err)
 	}
+
 	req.Header.Add("Content-Type", "application/x-git-upload-pack-request")
 	req.Header.Add("Accept", "application/x-git-upload-pack-result")
 	req.Header.Add("Git-Protocol", "version=2")
+
+	if authentication != "" {
+		req.Header.Add("Authorization", authentication)
+	}
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "cannot send a request to the upstream: %v", err)
 	}
 	defer resp.Body.Close()
+
 	if resp.StatusCode != http.StatusOK {
 		errMessage := ""
-		if strings.HasPrefix(resp.Header.Get("Content-Type"), "text/plain") {
+		if strings.HasPrefix(resp.Header.Get("Content-Type"), "text/html") {
 			bs, err := ioutil.ReadAll(resp.Body)
 			if err == nil {
 				errMessage = string(bs)
@@ -139,7 +191,7 @@ func (r *managedRepository) lsRefsUpstream(command []*gitprotocolio.ProtocolV2Re
 	return chunks, nil
 }
 
-func (r *managedRepository) fetchUpstream() (err error) {
+func (r *managedRepository) fetchUpstream(authentication string) (err error) {
 	op := r.startOperation("FetchUpstream")
 	defer func() {
 		op.Done(err)
@@ -162,10 +214,10 @@ func (r *managedRepository) fetchUpstream() (err error) {
 	defer r.mu.Unlock()
 	if splitGitFetch {
 		// Fetch heads and changes first.
-		err = runGit(op, r.localDiskPath, "fetch", "--progress", "-f", "-n", "origin", "refs/heads/*:refs/heads/*", "refs/changes/*:refs/changes/*")
+		err = runGit(op, r.localDiskPath, authentication, "fetch", "--progress", "-f", "-n", "origin", "refs/heads/*:refs/heads/*", "refs/changes/*:refs/changes/*")
 	}
 	if err == nil {
-		err = runGit(op, r.localDiskPath, "fetch", "--progress", "-f", "origin")
+		err = runGit(op, r.localDiskPath, authentication, "fetch", "--progress", "-f", "origin")
 	}
 	return err
 }
@@ -181,7 +233,19 @@ func (r *managedRepository) LastUpdateTime() time.Time {
 	return r.lastUpdate
 }
 
-func (r *managedRepository) RecoverFromBundle(bundlePath string) (err error) {
+func (r *managedRepository) Add(auth string) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	r.accessList = append(r.accessList, auth)
+}
+
+func (r *managedRepository) HasAccess(auth string) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return slices.Contains(r.accessList, auth)
+}
+
+func (r *managedRepository) RecoverFromBundle(bundlePath string, authentication string) (err error) {
 	op := r.startOperation("ReadBundle")
 	defer func() {
 		op.Done(err)
@@ -189,16 +253,16 @@ func (r *managedRepository) RecoverFromBundle(bundlePath string) (err error) {
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	err = runGit(op, r.localDiskPath, "fetch", "--progress", "-f", bundlePath, "refs/*:refs/*")
+	err = runGit(op, r.localDiskPath, authentication, "fetch", "--progress", "-f", bundlePath, "refs/*:refs/*")
 	return
 }
 
-func (r *managedRepository) WriteBundle(w io.Writer) (err error) {
+func (r *managedRepository) WriteBundle(w io.Writer, authentication string) (err error) {
 	op := r.startOperation("CreateBundle")
 	defer func() {
 		op.Done(err)
 	}()
-	err = runGitWithStdOut(op, w, r.localDiskPath, "bundle", "create", "-", "--all")
+	err = runGitWithStdOut(op, w, r.localDiskPath, authentication, "bundle", "create", "-", "--all")
 	return
 }
 
@@ -266,24 +330,34 @@ func (r *managedRepository) startOperation(op string) RunningOperation {
 	return noopOperation{}
 }
 
-func runGit(op RunningOperation, gitDir string, arg ...string) error {
+func runGit(op RunningOperation, gitDir string, authentication string, arg ...string) error {
 	cmd := exec.Command(gitBinary, arg...)
 	cmd.Env = []string{}
 	cmd.Dir = gitDir
 	cmd.Stderr = &operationWriter{op}
 	cmd.Stdout = &operationWriter{op}
+
+	if authentication != "" {
+		cmd.Args = append([]string{"-c", fmt.Sprintf("Authorization: %s", authentication)}, cmd.Args...)
+	}
+
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("failed to run a git command: %v", err)
 	}
 	return nil
 }
 
-func runGitWithStdOut(op RunningOperation, w io.Writer, gitDir string, arg ...string) error {
+func runGitWithStdOut(op RunningOperation, w io.Writer, gitDir string, authentication string, arg ...string) error {
 	cmd := exec.Command(gitBinary, arg...)
 	cmd.Env = []string{}
 	cmd.Dir = gitDir
 	cmd.Stdout = w
 	cmd.Stderr = &operationWriter{op}
+
+	if authentication != "" {
+		cmd.Args = append([]string{"-c", fmt.Sprintf("Authorization: %s", authentication)}, cmd.Args...)
+	}
+
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("failed to run a git command: %v", err)
 	}
